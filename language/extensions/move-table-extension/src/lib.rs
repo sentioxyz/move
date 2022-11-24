@@ -93,6 +93,14 @@ pub trait TableResolver {
         handle: &TableHandle,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, anyhow::Error>;
+
+    fn resolve_table_entry_with_key_value_ty(
+        &self,
+        handle: &TableHandle,
+        key_ty: &Type,
+        value_ty: &Type,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, anyhow::Error>;
 }
 
 /// A table operation, for supporting cost calculation.
@@ -265,6 +273,36 @@ impl Table {
             Entry::Occupied(entry) => (entry.into_mut(), None),
         })
     }
+
+    fn get_or_create_global_value_with_key_value_ty(
+        &mut self,
+        context: &NativeTableContext,
+        key_ty: &Type,
+        value_ty: &Type,
+        key: Vec<u8>,
+    ) -> PartialVMResult<(&mut GlobalValue, Option<Option<NumBytes>>)> {
+        Ok(match self.content.entry(key) {
+            Entry::Vacant(entry) => {
+                let (gv, loaded) = match context
+                    .resolver
+                    .resolve_table_entry_with_key_value_ty(&self.handle, key_ty, value_ty, entry.key())
+                    .map_err(|err| {
+                        partial_extension_error(format!("remote table resolver failure: {}", err))
+                    })? {
+                    Some(val_bytes) => {
+                        let val = deserialize(&self.value_layout, &val_bytes)?;
+                        (
+                            GlobalValue::cached(val)?,
+                            Some(NumBytes::new(val_bytes.len() as u64)),
+                        )
+                    }
+                    None => (GlobalValue::none(), None),
+                };
+                (entry.insert(gv), Some(loaded))
+            }
+            Entry::Occupied(entry) => (entry.into_mut(), None),
+        })
+    }
 }
 
 // =========================================================================================
@@ -414,7 +452,7 @@ fn native_add_box(
     let key_bytes = serialize(&table.key_layout, &key)?;
     cost += gas_params.per_byte_serialized * NumBytes::new(key_bytes.len() as u64);
 
-    let (gv, loaded) = table.get_or_create_global_value(table_context, key_bytes)?;
+    let (gv, loaded) = table.get_or_create_global_value_with_key_value_ty(table_context, &ty_args[0], &ty_args[2], key_bytes)?;
     cost += common_gas_params.calculate_load_cost(loaded);
 
     match gv.move_to(val) {
@@ -463,7 +501,7 @@ fn native_borrow_box(
     let key_bytes = serialize(&table.key_layout, &key)?;
     cost += gas_params.per_byte_serialized * NumBytes::new(key_bytes.len() as u64);
 
-    let (gv, loaded) = table.get_or_create_global_value(table_context, key_bytes)?;
+    let (gv, loaded) = table.get_or_create_global_value_with_key_value_ty(table_context, &ty_args[0], &ty_args[2], key_bytes)?;
     cost += common_gas_params.calculate_load_cost(loaded);
 
     match gv.borrow_global() {
@@ -512,7 +550,7 @@ fn native_contains_box(
     let key_bytes = serialize(&table.key_layout, &key)?;
     cost += gas_params.per_byte_serialized * NumBytes::new(key_bytes.len() as u64);
 
-    let (gv, loaded) = table.get_or_create_global_value(table_context, key_bytes)?;
+    let (gv, loaded) = table.get_or_create_global_value_with_key_value_ty(table_context, &ty_args[0], &ty_args[2],key_bytes)?;
     cost += common_gas_params.calculate_load_cost(loaded);
 
     let exists = Value::bool(gv.exists()?);
@@ -560,7 +598,7 @@ fn native_remove_box(
     let key_bytes = serialize(&table.key_layout, &key)?;
     cost += gas_params.per_byte_serialized * NumBytes::new(key_bytes.len() as u64);
 
-    let (gv, loaded) = table.get_or_create_global_value(table_context, key_bytes)?;
+    let (gv, loaded) = table.get_or_create_global_value_with_key_value_ty(table_context, &ty_args[0], &ty_args[2],key_bytes)?;
     cost += common_gas_params.calculate_load_cost(loaded);
 
     match gv.move_from() {

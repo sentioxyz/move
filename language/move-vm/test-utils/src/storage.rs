@@ -20,6 +20,7 @@ use {
     anyhow::Error,
     move_table_extension::{TableChangeSet, TableHandle, TableResolver},
 };
+use move_vm_types::loaded_data::runtime_types::Type;
 
 /// A dummy storage containing no modules or resources.
 #[derive(Debug, Clone)]
@@ -58,6 +59,10 @@ impl TableResolver for BlankStorage {
         _handle: &TableHandle,
         _key: &[u8],
     ) -> Result<Option<Vec<u8>>, Error> {
+        Ok(None)
+    }
+
+    fn resolve_table_entry_with_key_value_ty(&self, handle: &TableHandle, key_ty: &Type, value_ty: &Type, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, Error> {
         Ok(None)
     }
 }
@@ -110,6 +115,10 @@ impl<'a, 'b, S: TableResolver> TableResolver for DeltaStorage<'a, 'b, S> {
         key: &[u8],
     ) -> std::result::Result<Option<Vec<u8>>, Error> {
         // TODO: No support for table deltas
+        self.base.resolve_table_entry(handle, key)
+    }
+
+    fn resolve_table_entry_with_key_value_ty(&self, handle: &TableHandle, key_ty: &Type, value_ty: &Type, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, Error> {
         self.base.resolve_table_entry(handle, key)
     }
 }
@@ -317,6 +326,10 @@ impl TableResolver for InMemoryStorage {
         handle: &TableHandle,
         key: &[u8],
     ) -> std::result::Result<Option<Vec<u8>>, Error> {
+        Ok(self.tables.get(handle).and_then(|t| t.get(key).cloned()))
+    }
+
+    fn resolve_table_entry_with_key_value_ty(&self, handle: &TableHandle, key_ty: &Type, value_ty: &Type, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, Error> {
         Ok(self.tables.get(handle).and_then(|t| t.get(key).cloned()))
     }
 }
