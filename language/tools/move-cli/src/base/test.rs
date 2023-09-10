@@ -40,9 +40,9 @@ pub struct Test {
     /// Bound the amount of gas used by any one test.
     #[clap(name = "gas_limit", short = 'i', long = "gas_limit")]
     pub gas_limit: Option<u64>,
-    /// A filter string to determine which unit tests to run. A unit test will be run only if it
+    /// An optional filter string to determine which unit tests to run. A unit test will be run only if it
     /// contains this string in its fully qualified (<addr>::<module_name>::<fn_name>) name.
-    #[clap(name = "filter", short = 'f', long = "filter")]
+    #[clap(name = "filter")]
     pub filter: Option<String>,
     /// List all tests
     #[clap(name = "list", short = 'l', long = "list")]
@@ -199,7 +199,7 @@ pub fn run_move_unit_tests<W: Write + Send>(
     // Move package system, to first grab the compilation env, construct the test plan from it, and
     // then save it, before resuming the rest of the compilation and returning the results and
     // control back to the Move package system.
-    build_plan.compile_with_driver(writer, |compiler| {
+    build_plan.compile_with_driver(writer, None, |compiler| {
         let (files, comments_and_compiler_res) = compiler.run::<PASS_CFGIR>().unwrap();
         let (_, compiler) =
             diagnostics::unwrap_or_report_diagnostics(&files, comments_and_compiler_res);

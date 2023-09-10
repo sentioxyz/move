@@ -6,10 +6,7 @@
 
 use crate::cli::Options;
 use anyhow::anyhow;
-use codespan_reporting::{
-    diagnostic::Severity,
-    term::termcolor::{Buffer, ColorChoice, StandardStream, WriteColor},
-};
+use codespan_reporting::term::termcolor::{Buffer, ColorChoice, StandardStream, WriteColor};
 #[allow(unused_imports)]
 use log::{debug, info, warn};
 use move_abigen::Abigen;
@@ -26,6 +23,7 @@ use move_prover_boogie_backend::{
 use move_stackless_bytecode::{
     escape_analysis::EscapeAnalysisProcessor,
     function_target_pipeline::{FunctionTargetPipeline, FunctionTargetsHolder},
+    number_operation::GlobalNumberOperationState,
     pipeline_factory,
     read_write_set_analysis::{self, ReadWriteSetProcessor},
 };
@@ -69,6 +67,21 @@ pub fn run_move_prover<W: WriteColor>(
     run_move_prover_with_model(&env, error_writer, options, Some(now))
 }
 
+/// Create the initial number operation state for each function and struct
+pub fn create_init_num_operation_state(env: &GlobalEnv) {
+    let mut global_state: GlobalNumberOperationState = Default::default();
+    for module_env in env.get_modules() {
+        for struct_env in module_env.get_structs() {
+            global_state.create_initial_struct_oper_state(&struct_env);
+        }
+        for fun_env in module_env.get_functions() {
+            global_state.create_initial_func_oper_state(&fun_env);
+        }
+    }
+    //global_state.create_initial_exp_oper_state(env);
+    env.set_extension(global_state);
+}
+
 pub fn run_move_prover_with_model<W: WriteColor>(
     env: &GlobalEnv,
     error_writer: &mut W,
@@ -89,6 +102,9 @@ pub fn run_move_prover_with_model<W: WriteColor>(
     // Add the prover options as an extension to the environment, so they can be accessed
     // from there.
     env.set_extension(options.prover.clone());
+
+    // Populate initial number operation state for each function and struct based on the pragma
+    create_init_num_operation_state(env);
 
     // Until this point, prover and docgen have same code. Here we part ways.
     if options.run_docgen {
@@ -407,19 +423,9 @@ fn run_escape(env: &GlobalEnv, options: &Options, now: Instant) {
     pipeline.run(env, &mut targets);
     let end = now.elapsed();
 
-    // print escaped internal refs flagged by analysis. do not report errors in dependencies
+    // print all escaped internal refs flagged by analysis
     let mut error_writer = Buffer::no_color();
-    env.report_diag_with_filter(&mut error_writer, |d| {
-        let fname = env.get_file(d.labels[0].file_id).to_str().unwrap();
-        options.move_sources.iter().any(|d| {
-            let p = Path::new(d);
-            if p.is_file() {
-                d == fname
-            } else {
-                Path::new(fname).parent().unwrap() == p
-            }
-        }) && d.severity >= Severity::Error
-    });
+    env.report_diag(&mut error_writer, options.prover.report_severity);
     println!("{}", String::from_utf8_lossy(&error_writer.into_inner()));
     info!("in ms, analysis took {:.3}", (end - start).as_millis())
 }

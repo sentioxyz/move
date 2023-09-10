@@ -13,12 +13,14 @@ pub mod check_duplication;
 pub mod code_unit_verifier;
 pub mod constants;
 pub mod control_flow;
+pub mod control_flow_v5;
 pub mod cyclic_dependencies;
 pub mod dependencies;
 pub mod friends;
 pub mod instantiation_loops;
 pub mod instruction_consistency;
 pub mod limits;
+pub mod loop_summary;
 pub mod script_signature;
 pub mod signature;
 pub mod struct_defs;
@@ -33,12 +35,13 @@ pub use script_signature::{
 pub use signature::SignatureChecker;
 pub use struct_defs::RecursiveStructDefChecker;
 pub use verifier::{
-    verify_module, verify_module_with_config, verify_script, verify_script_with_config,
-    VerifierConfig,
+    verify_module, verify_module_with_config, verify_module_with_config_for_test, verify_script,
+    verify_script_with_config, VerifierConfig,
 };
 
 mod acquires_list_verifier;
 mod locals_safety;
+pub mod meter;
 mod reference_safety;
 mod regression_tests;
 mod stack_usage_verifier;

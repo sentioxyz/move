@@ -4,6 +4,8 @@
 
 //! Helpers for emitting Boogie code.
 
+// TODO(tengzhang): helpers specifically for bv types need to be refactored
+
 use itertools::Itertools;
 use num::BigUint;
 
@@ -39,12 +41,17 @@ pub fn boogie_module_name(env: &ModuleEnv<'_>) -> String {
 
 /// Return boogie name of given structure.
 pub fn boogie_struct_name(struct_env: &StructEnv<'_>, inst: &[Type]) -> String {
+    boogie_struct_name_bv(struct_env, inst, false)
+}
+
+pub fn boogie_struct_name_bv(struct_env: &StructEnv<'_>, inst: &[Type], bv_flag: bool) -> String {
     if struct_env.is_intrinsic_of(INTRINSIC_TYPE_MAP) {
         // Map to the theory type representation, which is `Table int V`. The key
         // is encoded as an integer to avoid extensionality problems, and to support
         // $Mutation paths, which are sequences of ints.
         let env = struct_env.module_env.env;
-        format!("Table int ({})", boogie_type(env, &inst[1]))
+        let type_fun = if bv_flag { boogie_bv_type } else { boogie_type };
+        format!("Table int ({})", type_fun(env, &inst[1]))
     } else {
         format!(
             "${}_{}{}",
@@ -68,7 +75,7 @@ pub fn boogie_field_sel(field_env: &FieldEnv<'_>, inst: &[Type]) -> String {
 /// Return field selector for given field.
 pub fn boogie_field_update(field_env: &FieldEnv<'_>, inst: &[Type]) -> String {
     let struct_env = &field_env.struct_env;
-    let suffix = boogie_type_suffix_for_struct(struct_env, inst);
+    let suffix = boogie_type_suffix_for_struct(struct_env, inst, false);
     format!(
         "$Update'{}'_{}",
         suffix,
@@ -83,6 +90,21 @@ pub fn boogie_function_name(fun_env: &FunctionEnv<'_>, inst: &[Type]) -> String 
         boogie_module_name(&fun_env.module_env),
         fun_env.get_name().display(fun_env.symbol_pool()),
         boogie_inst_suffix(fun_env.module_env.env, inst)
+    )
+}
+
+/// Return boogie name of given function
+/// Currently bv_flag is used when generating vector functions
+pub fn boogie_function_bv_name(
+    fun_env: &FunctionEnv<'_>,
+    inst: &[Type],
+    bv_flag: &[bool],
+) -> String {
+    format!(
+        "${}_{}{}",
+        boogie_module_name(&fun_env.module_env),
+        fun_env.get_name().display(fun_env.symbol_pool()),
+        boogie_inst_suffix_bv(fun_env.module_env.env, inst, bv_flag)
     )
 }
 
@@ -103,7 +125,12 @@ pub fn boogie_spec_var_name(
 }
 
 /// Return boogie name of given spec function.
-pub fn boogie_spec_fun_name(env: &ModuleEnv<'_>, id: SpecFunId, inst: &[Type]) -> String {
+pub fn boogie_spec_fun_name(
+    env: &ModuleEnv<'_>,
+    id: SpecFunId,
+    inst: &[Type],
+    bv_flag: bool,
+) -> String {
     let decl = env.get_spec_fun(id);
     let pos = env
         .get_spec_funs_of_name(decl.name)
@@ -114,12 +141,17 @@ pub fn boogie_spec_fun_name(env: &ModuleEnv<'_>, id: SpecFunId, inst: &[Type]) -
     } else {
         "".to_string()
     };
+    let mut suffix = boogie_inst_suffix_bv(env.env, inst, &[bv_flag]);
+    if env.is_table() {
+        assert_eq!(inst.len(), 2);
+        suffix = boogie_inst_suffix_bv_pair(env.env, inst, &[false, bv_flag]);
+    };
     format!(
         "${}_{}{}{}",
         boogie_module_name(env),
         decl.name.display(env.symbol_pool()),
         overload_qualifier,
-        boogie_inst_suffix(env.env, inst)
+        suffix
     )
 }
 
@@ -203,40 +235,118 @@ pub fn boogie_type(env: &GlobalEnv, ty: &Type) -> String {
     }
 }
 
+/// Return boogie type for a local with given signature token.
+/// TODO(tengzhang): combine with boogie_type later
+pub fn boogie_bv_type(env: &GlobalEnv, ty: &Type) -> String {
+    use PrimitiveType::*;
+    use Type::*;
+    match ty {
+        Primitive(p) => match p {
+            U8 => "bv8".to_string(),
+            U16 => "bv16".to_string(),
+            U32 => "bv32".to_string(),
+            U64 => "bv64".to_string(),
+            U128 => "bv128".to_string(),
+            U256 => "bv256".to_string(),
+            Address => "int".to_string(),
+            Signer => "$signer".to_string(),
+            Bool => "bool".to_string(),
+            Range | EventStore => panic!("unexpected type"),
+            Num => "<<num is not unsupported here>>".to_string(),
+        },
+        Vector(et) => format!("Vec ({})", boogie_bv_type(env, et)),
+        Struct(mid, sid, inst) => {
+            boogie_struct_name_bv(&env.get_module(*mid).into_struct(*sid), inst, true)
+        }
+        Reference(_, bt) => format!("$Mutation ({})", boogie_bv_type(env, bt)),
+        TypeParameter(idx) => boogie_type_param(env, *idx),
+        Fun(..) | Tuple(..) | TypeDomain(..) | ResourceDomain(..) | Error | Var(..) => {
+            format!("<<unsupported: {:?}>>", ty)
+        }
+    }
+}
+
 pub fn boogie_type_param(_env: &GlobalEnv, idx: u16) -> String {
     format!("#{}", idx)
 }
 
-pub fn boogie_temp(env: &GlobalEnv, ty: &Type, instance: usize) -> String {
-    boogie_temp_from_suffix(env, &boogie_type_suffix(env, ty), instance)
+pub fn boogie_temp(env: &GlobalEnv, ty: &Type, instance: usize, bv_flag: bool) -> String {
+    boogie_temp_from_suffix(env, &boogie_type_suffix_bv(env, ty, bv_flag), instance)
 }
 
 pub fn boogie_temp_from_suffix(_env: &GlobalEnv, suffix: &str, instance: usize) -> String {
     format!("$temp_{}'{}'", instance, suffix)
 }
 
-/// Returns the suffix to specialize a name for the given type instance.
-pub fn boogie_type_suffix(env: &GlobalEnv, ty: &Type) -> String {
+/// Generate number literals that may comes with a bv suffix in the boogie code
+pub fn boogie_num_literal(num: &String, base: usize, bv_flag: bool) -> String {
+    if bv_flag {
+        format!("{}bv{}", num, base)
+    } else {
+        num.clone()
+    }
+}
+
+pub fn boogie_num_type_string(num: &str, bv_flag: bool) -> String {
+    let pre = if bv_flag { "bv" } else { "u" };
+    [pre, num].join("")
+}
+
+pub fn boogie_num_type_string_capital(num: &str, bv_flag: bool) -> String {
+    let pre = if bv_flag { "Bv" } else { "U" };
+    [pre, num].join("")
+}
+
+pub fn boogie_num_type_base(ty: &Type) -> String {
     use PrimitiveType::*;
     use Type::*;
     match ty {
         Primitive(p) => match p {
-            U8 => "u8".to_string(),
-            U16 => "u16".to_string(),
-            U32 => "u32".to_string(),
-            U64 => "u64".to_string(),
-            U128 => "u128".to_string(),
-            U256 => "u256".to_string(),
-            Num => "num".to_string(),
+            U8 => "8".to_string(),
+            U16 => "16".to_string(),
+            U32 => "32".to_string(),
+            U64 => "64".to_string(),
+            U128 => "128".to_string(),
+            U256 => "256".to_string(),
+            Num => "<<num is not unsupported here>>".to_string(),
+            _ => format!("<<unsupported {:?}>>", ty),
+        },
+        _ => format!("<<unsupported {:?}>>", ty),
+    }
+}
+
+/// Returns the suffix to specialize a name for the given type instance.
+pub fn boogie_type_suffix_bv(env: &GlobalEnv, ty: &Type, bv_flag: bool) -> String {
+    use PrimitiveType::*;
+    use Type::*;
+
+    match ty {
+        Primitive(p) => match p {
+            U8 => boogie_num_type_string("8", bv_flag),
+            U16 => boogie_num_type_string("16", bv_flag),
+            U32 => boogie_num_type_string("32", bv_flag),
+            U64 => boogie_num_type_string("64", bv_flag),
+            U128 => boogie_num_type_string("128", bv_flag),
+            U256 => boogie_num_type_string("256", bv_flag),
+            Num => {
+                if bv_flag {
+                    "<<num is not unsupported here>>".to_string()
+                } else {
+                    "num".to_string()
+                }
+            }
             Address => "address".to_string(),
             Signer => "signer".to_string(),
             Bool => "bool".to_string(),
             Range => "range".to_string(),
             EventStore => format!("<<unsupported {:?}>>", ty),
         },
-        Vector(et) => format!("vec{}", boogie_inst_suffix(env, &[et.as_ref().to_owned()])),
+        Vector(et) => format!(
+            "vec{}",
+            boogie_inst_suffix_bv(env, &[et.as_ref().to_owned()], &[bv_flag])
+        ),
         Struct(mid, sid, inst) => {
-            boogie_type_suffix_for_struct(&env.get_module(*mid).into_struct(*sid), inst)
+            boogie_type_suffix_for_struct(&env.get_module(*mid).into_struct(*sid), inst, bv_flag)
         }
         TypeParameter(idx) => boogie_type_param(env, *idx),
         Fun(..) | Tuple(..) | TypeDomain(..) | ResourceDomain(..) | Error | Var(..)
@@ -244,16 +354,60 @@ pub fn boogie_type_suffix(env: &GlobalEnv, ty: &Type) -> String {
     }
 }
 
-pub fn boogie_type_suffix_for_struct(struct_env: &StructEnv<'_>, inst: &[Type]) -> String {
+/// Return the suffix to specialize a name for the given type instance.
+pub fn boogie_type_suffix(env: &GlobalEnv, ty: &Type) -> String {
+    boogie_type_suffix_bv(env, ty, false)
+}
+
+pub fn boogie_type_suffix_for_struct(
+    struct_env: &StructEnv<'_>,
+    inst: &[Type],
+    bv_flag: bool,
+) -> String {
     if struct_env.is_intrinsic_of(INTRINSIC_TYPE_MAP) {
         format!(
             "${}_{}{}",
             boogie_module_name(&struct_env.module_env),
             struct_env.get_name().display(struct_env.symbol_pool()),
-            boogie_inst_suffix(struct_env.module_env.env, inst)
+            boogie_inst_suffix_bv_pair(struct_env.module_env.env, inst, &[false, bv_flag])
         )
     } else {
         boogie_struct_name(struct_env, inst)
+    }
+}
+
+/// Generate suffix after instantiation of type parameters
+pub fn boogie_inst_suffix_bv(env: &GlobalEnv, inst: &[Type], bv_flag: &[bool]) -> String {
+    if inst.is_empty() {
+        "".to_owned()
+    } else {
+        let suffix = if bv_flag.len() == 1 {
+            inst.iter()
+                .map(|ty| boogie_type_suffix_bv(env, ty, bv_flag[0]))
+                .join("_")
+        } else {
+            assert_eq!(inst.len(), bv_flag.len());
+            inst.iter()
+                .zip(bv_flag.iter())
+                .map(|(ty, flag)| boogie_type_suffix_bv(env, ty, *flag))
+                .join("_")
+        };
+        format!("'{}'", suffix)
+    }
+}
+
+pub fn boogie_inst_suffix_bv_pair(env: &GlobalEnv, inst: &[Type], bv_flag: &[bool]) -> String {
+    if inst.is_empty() {
+        "".to_owned()
+    } else {
+        assert_eq!(inst.len(), bv_flag.len());
+        format!(
+            "'{}'",
+            inst.iter()
+                .zip(bv_flag.iter())
+                .map(|(ty, flag)| boogie_type_suffix_bv(env, ty, *flag))
+                .join("_")
+        )
     }
 }
 
@@ -268,12 +422,24 @@ pub fn boogie_inst_suffix(env: &GlobalEnv, inst: &[Type]) -> String {
     }
 }
 
-pub fn boogie_equality_for_type(env: &GlobalEnv, eq: bool, ty: &Type) -> String {
+pub fn boogie_equality_for_type(env: &GlobalEnv, eq: bool, ty: &Type, bv_flag: bool) -> String {
     format!(
         "{}'{}'",
         if eq { "$IsEqual" } else { "!$IsEqual" },
-        boogie_type_suffix(env, ty)
+        boogie_type_suffix_bv(env, ty, bv_flag)
     )
+}
+
+/// Create boogie well-formed boolean expression
+/// TODO(tengzhang): combine with boogie_well_formed_expr
+pub fn boogie_well_formed_expr_bv(env: &GlobalEnv, name: &str, ty: &Type, bv_flag: bool) -> String {
+    let target = if ty.is_reference() {
+        format!("$Dereference({})", name)
+    } else {
+        name.to_owned()
+    };
+    let suffix = boogie_type_suffix_bv(env, ty.skip_reference(), bv_flag);
+    format!("$IsValid'{}'({})", suffix, target)
 }
 
 /// Create boogie well-formed boolean expression.
@@ -289,8 +455,8 @@ pub fn boogie_well_formed_expr(env: &GlobalEnv, name: &str, ty: &Type) -> String
 
 /// Create boogie well-formed check. The result will be either an empty string or a
 /// newline-terminated assume statement.
-pub fn boogie_well_formed_check(env: &GlobalEnv, name: &str, ty: &Type) -> String {
-    let expr = boogie_well_formed_expr(env, name, ty);
+pub fn boogie_well_formed_check(env: &GlobalEnv, name: &str, ty: &Type, bv_flag: bool) -> String {
+    let expr = boogie_well_formed_expr_bv(env, name, ty, bv_flag);
     if !expr.is_empty() {
         format!("assume {};", expr)
     } else {
@@ -311,10 +477,15 @@ pub fn boogie_declare_global(env: &GlobalEnv, name: &str, ty: &Type) -> String {
     )
 }
 
-pub fn boogie_byte_blob(_options: &BoogieOptions, val: &[u8]) -> String {
-    let args = val.iter().map(|v| format!("{}", *v)).collect_vec();
+pub fn boogie_byte_blob(_options: &BoogieOptions, val: &[u8], bv_flag: bool) -> String {
+    let val_suffix = if bv_flag { "bv8" } else { "" };
+    let suffix = if bv_flag { "bv8" } else { "u8" };
+    let args = val
+        .iter()
+        .map(|v| format!("{}{}", *v, val_suffix))
+        .collect_vec();
     if args.is_empty() {
-        "$EmptyVec'u8'()".to_string()
+        format!("$EmptyVec'{}'()", suffix)
     } else {
         boogie_make_vec_from_strings(&args)
     }
@@ -329,6 +500,8 @@ pub fn boogie_address_blob(_options: &BoogieOptions, val: &[BigUint]) -> String 
     }
 }
 
+/// Generate vectors for constant values
+/// TODO(tengzhang): add support for bv types
 pub fn boogie_constant_blob(_options: &BoogieOptions, val: &[Constant]) -> String {
     let args = val
         .iter()
@@ -350,7 +523,7 @@ pub fn boogie_constant(_options: &BoogieOptions, val: &Constant) -> String {
         Constant::U128(num) => num.to_string(),
         Constant::U256(num) => num.to_string(),
         Constant::Address(v) => v.to_string(),
-        Constant::ByteArray(v) => boogie_byte_blob(_options, v),
+        Constant::ByteArray(v) => boogie_byte_blob(_options, v, false),
         Constant::AddressArray(v) => boogie_address_blob(_options, v),
         Constant::Vector(vec) => boogie_make_vec_from_strings(
             &vec.iter()
@@ -377,7 +550,7 @@ pub fn boogie_value(_options: &BoogieOptions, val: &Value) -> String {
         Value::Bool(false) => "false".to_string(),
         Value::Number(num) => num.to_string(),
         Value::Address(v) => v.to_string(),
-        Value::ByteArray(v) => boogie_byte_blob(_options, v),
+        Value::ByteArray(v) => boogie_byte_blob(_options, v, false),
         Value::AddressArray(v) => boogie_address_blob(_options, v),
         Value::Vector(vec) => boogie_make_vec_from_strings(
             &vec.iter().map(|v| boogie_value(_options, v)).collect_vec(),
@@ -391,8 +564,9 @@ pub fn boogie_debug_track_local(
     origin_idx: TempIndex,
     idx: TempIndex,
     ty: &Type,
+    bv_flag: bool,
 ) -> String {
-    boogie_debug_track(fun_target, "$track_local", origin_idx, idx, ty)
+    boogie_debug_track(fun_target, "$track_local", origin_idx, idx, ty, bv_flag)
 }
 
 fn boogie_debug_track(
@@ -401,11 +575,12 @@ fn boogie_debug_track(
     tracked_idx: usize,
     idx: TempIndex,
     ty: &Type,
+    bv_flag: bool,
 ) -> String {
     let fun_def_idx = fun_target.func_env.get_def_idx();
     let value = format!("$t{}", idx);
     if ty.is_reference() {
-        let temp_name = boogie_temp(fun_target.global_env(), ty.skip_reference(), 0);
+        let temp_name = boogie_temp(fun_target.global_env(), ty.skip_reference(), 0, bv_flag);
         format!(
             "{} := $Dereference({});\n\
              assume {{:print \"{}({},{},{}):\", {}}} {} == {};",
@@ -452,13 +627,14 @@ pub fn boogie_debug_track_return(
     ret_idx: usize,
     idx: TempIndex,
     ty: &Type,
+    bv_flag: bool,
 ) -> String {
-    boogie_debug_track(fun_target, "$track_return", ret_idx, idx, ty)
+    boogie_debug_track(fun_target, "$track_return", ret_idx, idx, ty, bv_flag)
 }
 
-enum TypeIdentToken {
+pub enum TypeIdentToken {
     Char(u8),
-    Symbolic(TypeParameterIndex),
+    Variable(String),
 }
 
 impl TypeIdentToken {
@@ -492,16 +668,12 @@ impl TypeIdentToken {
                         k - start,
                         match &tokens[k] {
                             TypeIdentToken::Char(c) => *c,
-                            TypeIdentToken::Symbolic(_) => unreachable!(),
+                            TypeIdentToken::Variable(_) => unreachable!(),
                         }
                     )
                 })
                 .join("");
             format!("Vec(DefaultVecMap(){}, {})", elements, end - start)
-        }
-
-        fn get_symbol_name(idx: TypeParameterIndex) -> String {
-            format!("#{}_name", idx)
         }
 
         // construct all the segments
@@ -515,12 +687,12 @@ impl TypeIdentToken {
                         char_seq_start = Some(i);
                     }
                 }
-                TypeIdentToken::Symbolic(idx) => {
+                TypeIdentToken::Variable(name) => {
                     if let Some(start) = &char_seq_start {
                         segments.push(get_char_array(&tokens, *start, i));
                     };
                     char_seq_start = None;
-                    segments.push(get_symbol_name(*idx));
+                    segments.push(name.clone());
                 }
             }
         }
@@ -541,17 +713,47 @@ impl TypeIdentToken {
         }
         cursor
     }
+}
 
-    pub fn convert_to_string(std_address: BigUint, tokens: Vec<TypeIdentToken>) -> String {
-        format!(
-            "${}_string_String({})",
-            std_address,
-            Self::convert_to_bytes(tokens)
-        )
+/// A formatter for address
+pub struct AddressFormatter {
+    /// whether the `0x` prefix is needed
+    pub prefix: bool,
+    /// whether to include leading zeros
+    pub full_length: bool,
+    /// whether to capitalize the hex repr
+    pub capitalized: bool,
+}
+
+impl AddressFormatter {
+    pub fn format(&self, addr: &BigUint) -> String {
+        let result = addr.to_str_radix(16);
+        // into correct length
+        let result = if self.full_length {
+            format!("{:0>32}", result)
+        } else {
+            result
+        };
+        // into correct case
+        let result = if self.capitalized {
+            result.to_uppercase()
+        } else {
+            result
+        };
+        // with or without prefix
+        if self.prefix {
+            format!("0x{}", result)
+        } else {
+            result
+        }
     }
 }
 
-fn type_name_to_ident_tokens(env: &GlobalEnv, ty: &Type) -> Vec<TypeIdentToken> {
+fn type_name_to_ident_tokens(
+    env: &GlobalEnv,
+    ty: &Type,
+    formatter: &AddressFormatter,
+) -> Vec<TypeIdentToken> {
     match ty {
         Type::Primitive(PrimitiveType::Bool) => TypeIdentToken::make("bool"),
         Type::Primitive(PrimitiveType::U8) => TypeIdentToken::make("u8"),
@@ -564,7 +766,7 @@ fn type_name_to_ident_tokens(env: &GlobalEnv, ty: &Type) -> Vec<TypeIdentToken> 
         Type::Primitive(PrimitiveType::Signer) => TypeIdentToken::make("signer"),
         Type::Vector(element) => {
             let mut tokens = TypeIdentToken::make("vector<");
-            tokens.extend(type_name_to_ident_tokens(env, element));
+            tokens.extend(type_name_to_ident_tokens(env, element, formatter));
             tokens.extend(TypeIdentToken::make(">"));
             tokens
         }
@@ -572,8 +774,8 @@ fn type_name_to_ident_tokens(env: &GlobalEnv, ty: &Type) -> Vec<TypeIdentToken> 
             let module_env = env.get_module(*mid);
             let struct_env = module_env.get_struct(*sid);
             let type_name = format!(
-                "0x{}::{}::{}",
-                module_env.get_name().addr().to_str_radix(16),
+                "{}::{}::{}",
+                formatter.format(module_env.get_name().addr()),
                 module_env
                     .get_name()
                     .name()
@@ -585,7 +787,7 @@ fn type_name_to_ident_tokens(env: &GlobalEnv, ty: &Type) -> Vec<TypeIdentToken> 
                 tokens.extend(TypeIdentToken::make("<"));
                 let ty_args_tokens = ty_args
                     .iter()
-                    .map(|t| type_name_to_ident_tokens(env, t))
+                    .map(|t| type_name_to_ident_tokens(env, t, formatter))
                     .collect();
                 tokens.extend(TypeIdentToken::join(", ", ty_args_tokens));
                 tokens.extend(TypeIdentToken::make(">"));
@@ -593,7 +795,10 @@ fn type_name_to_ident_tokens(env: &GlobalEnv, ty: &Type) -> Vec<TypeIdentToken> 
             tokens
         }
         Type::TypeParameter(idx) => {
-            vec![TypeIdentToken::Symbolic(*idx)]
+            vec![TypeIdentToken::Variable(format!(
+                "$TypeName(#{}_info)",
+                *idx
+            ))]
         }
         // move types that are not allowed
         Type::Reference(..) | Type::Tuple(..) => {
@@ -616,9 +821,36 @@ fn type_name_to_ident_tokens(env: &GlobalEnv, ty: &Type) -> Vec<TypeIdentToken> 
 }
 
 /// Convert a type name into a format that can be recognized by Boogie
-pub fn boogie_reflection_type_name(env: &GlobalEnv, ty: &Type) -> String {
-    let tokens = type_name_to_ident_tokens(env, ty);
-    TypeIdentToken::convert_to_string(env.get_stdlib_address(), tokens)
+///
+/// The `stdlib` bool flag represents whether this type name is intended for
+/// - true  --> `std::type_name` and
+/// - false --> `ext::type_info`.
+/// TODO(mengxu): the above is a very hacky, we need a better way to differentiate
+pub fn boogie_reflection_type_name(env: &GlobalEnv, ty: &Type, stdlib: bool) -> String {
+    let formatter = if stdlib {
+        AddressFormatter {
+            prefix: false,
+            full_length: true,
+            capitalized: false,
+        }
+    } else {
+        AddressFormatter {
+            prefix: true,
+            full_length: false,
+            capitalized: false,
+        }
+    };
+    let bytes = TypeIdentToken::convert_to_bytes(type_name_to_ident_tokens(env, ty, &formatter));
+    if stdlib {
+        format!(
+            "${}_type_name_TypeName(${}_ascii_String({}))",
+            env.get_stdlib_address(),
+            env.get_stdlib_address(),
+            bytes
+        )
+    } else {
+        format!("${}_string_String({})", env.get_stdlib_address(), bytes)
+    }
 }
 
 enum TypeInfoPack {
@@ -679,16 +911,16 @@ fn type_name_to_info_pack(env: &GlobalEnv, ty: &Type) -> Option<TypeInfoPack> {
 /// Convert a type info into a format that can be recognized by Boogie
 pub fn boogie_reflection_type_info(env: &GlobalEnv, ty: &Type) -> (String, String) {
     fn get_symbol_is_struct(idx: TypeParameterIndex) -> String {
-        format!("#{}_is_struct", idx)
+        format!("is#$TypeParamStruct(#{}_info)", idx)
     }
     fn get_symbol_account_address(idx: TypeParameterIndex) -> String {
-        format!("#{}_account_address", idx)
+        format!("a#$TypeParamStruct(#{}_info)", idx)
     }
     fn get_symbol_module_name(idx: TypeParameterIndex) -> String {
-        format!("#{}_module_name", idx)
+        format!("m#$TypeParamStruct(#{}_info)", idx)
     }
     fn get_symbol_struct_name(idx: TypeParameterIndex) -> String {
-        format!("#{}_struct_name", idx)
+        format!("s#$TypeParamStruct(#{}_info)", idx)
     }
 
     let extlib_address = env.get_extlib_address();
@@ -721,5 +953,14 @@ pub fn boogie_reflection_type_info(env: &GlobalEnv, ty: &Type) -> (String, Strin
                 get_symbol_struct_name(idx)
             ),
         ),
+    }
+}
+
+/// Encode the test on whether a type is a struct in a format that can be recognized by Boogie
+pub fn boogie_reflection_type_is_struct(env: &GlobalEnv, ty: &Type) -> String {
+    match type_name_to_info_pack(env, ty) {
+        None => "false".to_string(),
+        Some(TypeInfoPack::Struct(..)) => "true".to_string(),
+        Some(TypeInfoPack::Symbolic(idx)) => format!("is#$TypeParamStruct(#{}_info)", idx),
     }
 }

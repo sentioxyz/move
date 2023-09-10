@@ -17,7 +17,7 @@ use move_binary_format::{
         FieldHandleIndex, FieldInstantiationIndex, FunctionDefinition, FunctionDefinitionIndex,
         FunctionHandleIndex, FunctionInstantiationIndex, Signature, SignatureIndex, SignatureToken,
         StructDefInstantiationIndex, StructDefinition, StructDefinitionIndex,
-        StructFieldInformation, TableIndex, Visibility,
+        StructFieldInformation, TableIndex, TypeParameterIndex, Visibility,
     },
     IndexKind,
 };
@@ -31,7 +31,7 @@ use move_core_types::{
 };
 use move_vm_types::{
     data_store::DataStore,
-    loaded_data::runtime_types::{CachedStructIndex, StructType, Type},
+    loaded_data::runtime_types::{CachedStructIndex, DepthFormula, StructType, Type},
 };
 use parking_lot::RwLock;
 use sha3::{Digest, Sha3_256};
@@ -203,6 +203,30 @@ impl ModuleCache {
             self.structs.truncate(starting_idx);
             err.finish(Location::Undefined)
         })?;
+
+        let struct_defs_len = module.struct_defs.len();
+
+        let mut depth_cache = BTreeMap::new();
+
+        for cached_idx in starting_idx..(starting_idx + struct_defs_len) {
+            self.calculate_depth_of_struct(CachedStructIndex(cached_idx), &mut depth_cache)
+                .map_err(|err| err.finish(Location::Undefined))?;
+        }
+        debug_assert!(depth_cache.len() == struct_defs_len);
+        for (cache_idx, depth) in depth_cache {
+            match Arc::get_mut(self.structs.get_mut(cache_idx.0).unwrap()) {
+                Some(struct_type) => struct_type.depth = Some(depth),
+                None => {
+                    // we have pending references to the `Arc` which is impossible,
+                    // given the code that adds the `Arc` is above and no reference to
+                    // it should exist.
+                    // So in the spirit of not crashing we just leave it as None and
+                    // log the issue.
+                    error!("Arc<StructType> cannot have any live reference while publishing");
+                }
+            }
+        }
+
         for (idx, func) in module.function_defs().iter().enumerate() {
             let findex = FunctionDefinitionIndex(idx as TableIndex);
             let mut function = Function::new(natives, findex, func, module);
@@ -258,6 +282,7 @@ impl ModuleCache {
             name,
             module,
             struct_def: idx,
+            depth: None,
         }
     }
 
@@ -368,7 +393,7 @@ impl ModuleCache {
             SignatureToken::U256 => Type::U256,
             SignatureToken::Address => Type::Address,
             SignatureToken::Signer => Type::Signer,
-            SignatureToken::TypeParameter(idx) => Type::TyParam(*idx as usize),
+            SignatureToken::TypeParameter(idx) => Type::TyParam(*idx),
             SignatureToken::Vector(inner_tok) => {
                 let inner_type = Self::make_type_internal(module, inner_tok, resolver)?;
                 Type::Vector(Box::new(inner_type))
@@ -458,6 +483,81 @@ impl ModuleCache {
                 )),
             ),
         }
+    }
+
+    fn calculate_depth_of_struct(
+        &self,
+        def_idx: CachedStructIndex,
+        depth_cache: &mut BTreeMap<CachedStructIndex, DepthFormula>,
+    ) -> PartialVMResult<DepthFormula> {
+        let struct_type = &self.struct_at(def_idx);
+
+        // If we've already computed this structs depth, no more work remains to be done.
+        if let Some(form) = &struct_type.depth {
+            return Ok(form.clone());
+        }
+        if let Some(form) = depth_cache.get(&def_idx) {
+            return Ok(form.clone());
+        }
+
+        let formulas = struct_type
+            .fields
+            .iter()
+            .map(|field_type| self.calculate_depth_of_type(field_type, depth_cache))
+            .collect::<PartialVMResult<Vec<_>>>()?;
+        let formula = DepthFormula::normalize(formulas);
+        let prev = depth_cache.insert(def_idx, formula.clone());
+        if prev.is_some() {
+            return Err(
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Recursive type?".to_owned()),
+            );
+        }
+        Ok(formula)
+    }
+
+    fn calculate_depth_of_type(
+        &self,
+        ty: &Type,
+        depth_cache: &mut BTreeMap<CachedStructIndex, DepthFormula>,
+    ) -> PartialVMResult<DepthFormula> {
+        Ok(match ty {
+            Type::Bool
+            | Type::U8
+            | Type::U64
+            | Type::U128
+            | Type::Address
+            | Type::Signer
+            | Type::U16
+            | Type::U32
+            | Type::U256 => DepthFormula::constant(1),
+            Type::Vector(ty) | Type::Reference(ty) | Type::MutableReference(ty) => {
+                let mut inner = self.calculate_depth_of_type(ty, depth_cache)?;
+                inner.scale(1);
+                inner
+            }
+            Type::TyParam(ty_idx) => DepthFormula::type_parameter(*ty_idx),
+            Type::Struct(cache_idx) => {
+                let mut struct_formula = self.calculate_depth_of_struct(*cache_idx, depth_cache)?;
+                debug_assert!(struct_formula.terms.is_empty());
+                struct_formula.scale(1);
+                struct_formula
+            }
+            Type::StructInstantiation(cache_idx, ty_args) => {
+                let ty_arg_map = ty_args
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, ty)| {
+                        let var = idx as TypeParameterIndex;
+                        Ok((var, self.calculate_depth_of_type(ty, depth_cache)?))
+                    })
+                    .collect::<PartialVMResult<BTreeMap<_, _>>>()?;
+                let struct_formula = self.calculate_depth_of_struct(*cache_idx, depth_cache)?;
+                let mut subst_struct_formula = struct_formula.subst(ty_arg_map)?;
+                subst_struct_formula.scale(1);
+                subst_struct_formula
+            }
+        })
     }
 }
 
@@ -829,6 +929,7 @@ impl Loader {
             &mut visited,
             &mut friends_discovered,
             /* allow_dependency_loading_failure */ true,
+            /* dependencies_depth */ 0,
         )?;
 
         // upward exploration of the modules's dependency graph. Similar to dependency loading, as
@@ -840,6 +941,7 @@ impl Loader {
             bundle_unverified,
             data_store,
             /* allow_friend_loading_failure */ true,
+            /* dependencies_depth */ 0,
         )?;
 
         // make sure there is no cyclic dependency
@@ -1002,6 +1104,7 @@ impl Loader {
             bundle_unverified,
             data_store,
             /* allow_module_loading_failure */ true,
+            /* dependencies_depth */ 0,
         )?;
 
         // verify that the transitive closure does not have cycles
@@ -1073,6 +1176,7 @@ impl Loader {
         visited: &mut BTreeSet<ModuleId>,
         friends_discovered: &mut BTreeSet<ModuleId>,
         allow_module_loading_failure: bool,
+        dependencies_depth: usize,
     ) -> VMResult<Arc<Module>> {
         // dependency loading does not permit cycles
         if visited.contains(id) {
@@ -1094,6 +1198,7 @@ impl Loader {
             visited,
             friends_discovered,
             /* allow_dependency_loading_failure */ false,
+            dependencies_depth,
         )?;
 
         // if linking goes well, insert the module to the code cache
@@ -1113,7 +1218,16 @@ impl Loader {
         visited: &mut BTreeSet<ModuleId>,
         friends_discovered: &mut BTreeSet<ModuleId>,
         allow_dependency_loading_failure: bool,
+        dependencies_depth: usize,
     ) -> VMResult<()> {
+        if let Some(max_dependency_depth) = self.vm_config.verifier.max_dependency_depth {
+            if dependencies_depth > max_dependency_depth {
+                return Err(
+                    PartialVMError::new(StatusCode::MAX_DEPENDENCY_DEPTH_REACHED)
+                        .finish(Location::Undefined),
+                );
+            }
+        }
         // all immediate dependencies of the module being verified should be in one of the locations
         // - the verified portion of the bundle (e.g., verified before this module)
         // - the code cache (i.e., loaded already)
@@ -1135,6 +1249,7 @@ impl Loader {
                             visited,
                             friends_discovered,
                             allow_dependency_loading_failure,
+                            dependencies_depth + 1,
                         )?
                     }
                     Some(cached) => cached,
@@ -1170,6 +1285,7 @@ impl Loader {
         bundle_unverified: &BTreeSet<ModuleId>,
         data_store: &impl DataStore,
         allow_module_loading_failure: bool,
+        dependencies_depth: usize,
     ) -> VMResult<Arc<Module>> {
         // load the closure of the module in terms of dependency relation
         let mut visited = BTreeSet::new();
@@ -1181,6 +1297,7 @@ impl Loader {
             &mut visited,
             &mut friends_discovered,
             allow_module_loading_failure,
+            0,
         )?;
 
         // upward exploration of the module's friendship graph and expand the friendship frontier.
@@ -1192,6 +1309,7 @@ impl Loader {
             bundle_unverified,
             data_store,
             /* allow_friend_loading_failure */ false,
+            dependencies_depth,
         )?;
         Ok(module_ref)
     }
@@ -1204,7 +1322,16 @@ impl Loader {
         bundle_unverified: &BTreeSet<ModuleId>,
         data_store: &impl DataStore,
         allow_friend_loading_failure: bool,
+        dependencies_depth: usize,
     ) -> VMResult<()> {
+        if let Some(max_dependency_depth) = self.vm_config.verifier.max_dependency_depth {
+            if dependencies_depth > max_dependency_depth {
+                return Err(
+                    PartialVMError::new(StatusCode::MAX_DEPENDENCY_DEPTH_REACHED)
+                        .finish(Location::Undefined),
+                );
+            }
+        }
         // for each new module discovered in the frontier, load them fully and expand the frontier.
         // apply three filters to the new friend modules discovered
         // - `!locked_cache.has_module(mid)`
@@ -1237,9 +1364,30 @@ impl Loader {
                 bundle_unverified,
                 data_store,
                 allow_friend_loading_failure,
+                dependencies_depth + 1,
             )?;
         }
         Ok(())
+    }
+
+    // Return an instantiated type given a generic and an instantiation.
+    // Stopgap to avoid a recursion that is either taking too long or using too
+    // much memory
+    fn subst(&self, ty: &Type, ty_args: &[Type]) -> PartialVMResult<Type> {
+        // Before instantiating the type, count the # of nodes of all type arguments plus
+        // existing type instantiation.
+        // If that number is larger than MAX_TYPE_INSTANTIATION_NODES, refuse to construct this type.
+        // This prevents constructing larger and lager types via struct instantiation.
+        if let Type::StructInstantiation(_, struct_inst) = ty {
+            let mut sum_nodes = 1u64;
+            for ty in ty_args.iter().chain(struct_inst.iter()) {
+                sum_nodes = sum_nodes.saturating_add(self.count_type_nodes(ty));
+                if sum_nodes > MAX_TYPE_INSTANTIATION_NODES {
+                    return Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES));
+                }
+            }
+        }
+        ty.subst(ty_args)
     }
 
     // Verify the kind (constraints) of an instantiation.
@@ -1415,7 +1563,16 @@ impl<'a> Resolver<'a> {
         };
         let mut instantiation = vec![];
         for ty in &func_inst.instantiation {
-            instantiation.push(ty.subst(type_params)?);
+            instantiation.push(self.subst(ty, type_params)?);
+        }
+        // Check if the function instantiation over all generics is larger
+        // than MAX_TYPE_INSTANTIATION_NODES.
+        let mut sum_nodes = 1u64;
+        for ty in type_params.iter().chain(instantiation.iter()) {
+            sum_nodes = sum_nodes.saturating_add(self.loader.count_type_nodes(ty));
+            if sum_nodes > MAX_TYPE_INSTANTIATION_NODES {
+                return Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES));
+            }
         }
         Ok(instantiation)
     }
@@ -1450,12 +1607,25 @@ impl<'a> Resolver<'a> {
             BinaryType::Module(module) => module.struct_instantiation_at(idx.0),
             BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
         };
+
+        // Before instantiating the type, count the # of nodes of all type arguments plus
+        // existing type instantiation.
+        // If that number is larger than MAX_TYPE_INSTANTIATION_NODES, refuse to construct this type.
+        // This prevents constructing larger and larger types via struct instantiation.
+        let mut sum_nodes = 1u64;
+        for ty in ty_args.iter().chain(struct_inst.instantiation.iter()) {
+            sum_nodes = sum_nodes.saturating_add(self.loader.count_type_nodes(ty));
+            if sum_nodes > MAX_TYPE_INSTANTIATION_NODES {
+                return Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES));
+            }
+        }
+
         Ok(Type::StructInstantiation(
             struct_inst.def,
             struct_inst
                 .instantiation
                 .iter()
-                .map(|ty| ty.subst(ty_args))
+                .map(|ty| self.subst(ty, ty_args))
                 .collect::<PartialVMResult<_>>()?,
         ))
     }
@@ -1558,10 +1728,14 @@ impl<'a> Resolver<'a> {
     ) -> PartialVMResult<Type> {
         let ty = self.single_type_at(idx);
         if !ty_args.is_empty() {
-            ty.subst(ty_args)
+            self.subst(ty, ty_args)
         } else {
             Ok(ty.clone())
         }
+    }
+
+    pub(crate) fn subst(&self, ty: &Type, ty_args: &[Type]) -> PartialVMResult<Type> {
+        self.loader.subst(ty, ty_args)
     }
 
     //
@@ -2390,6 +2564,8 @@ struct StructInfo {
     struct_tag: Option<StructTag>,
     struct_layout: Option<MoveStructLayout>,
     annotated_struct_layout: Option<MoveStructLayout>,
+    node_count: Option<u64>,
+    annotated_node_count: Option<u64>,
 }
 
 impl StructInfo {
@@ -2398,6 +2574,8 @@ impl StructInfo {
             struct_tag: None,
             struct_layout: None,
             annotated_struct_layout: None,
+            node_count: None,
+            annotated_node_count: None,
         }
     }
 }
@@ -2414,7 +2592,16 @@ impl TypeCache {
     }
 }
 
-const VALUE_DEPTH_MAX: usize = 128;
+/// Maximal depth of a value in terms of type depth.
+pub const VALUE_DEPTH_MAX: u64 = 128;
+
+/// Maximal nodes which are allowed when converting to layout. This includes the the types of
+/// fields for struct types.
+const MAX_TYPE_TO_LAYOUT_NODES: u64 = 256;
+
+/// Maximal nodes which are all allowed when instantiating a generic type. This does not include
+/// field types of structs.
+const MAX_TYPE_INSTANTIATION_NODES: u64 = 128;
 
 impl Loader {
     fn struct_gidx_to_type_tag(
@@ -2476,77 +2663,150 @@ impl Loader {
                 return Err(
                     PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                         .with_message(format!("no type tag for {:?}", ty)),
-                )
+                );
             }
         })
+    }
+
+    fn count_type_nodes(&self, ty: &Type) -> u64 {
+        let mut todo = vec![ty];
+        let mut result = 0;
+        while let Some(ty) = todo.pop() {
+            match ty {
+                Type::Vector(ty) | Type::Reference(ty) | Type::MutableReference(ty) => {
+                    result += 1;
+                    todo.push(ty);
+                }
+                Type::StructInstantiation(_, ty_args) => {
+                    result += 1;
+                    todo.extend(ty_args.iter())
+                }
+                _ => {
+                    result += 1;
+                }
+            }
+        }
+        result
     }
 
     fn struct_gidx_to_type_layout(
         &self,
         gidx: CachedStructIndex,
         ty_args: &[Type],
-        depth: usize,
+        count: &mut u64,
+        depth: u64,
     ) -> PartialVMResult<MoveStructLayout> {
         if let Some(struct_map) = self.type_cache.read().structs.get(&gidx) {
             if let Some(struct_info) = struct_map.get(ty_args) {
+                if let Some(node_count) = &struct_info.node_count {
+                    *count += *node_count
+                }
                 if let Some(layout) = &struct_info.struct_layout {
                     return Ok(layout.clone());
                 }
             }
         }
 
+        let count_before = *count;
         let struct_type = self.module_cache.read().struct_at(gidx);
         let field_tys = struct_type
             .fields
             .iter()
-            .map(|ty| ty.subst(ty_args))
+            .map(|ty| self.subst(ty, ty_args))
             .collect::<PartialVMResult<Vec<_>>>()?;
         let field_layouts = field_tys
             .iter()
-            .map(|ty| self.type_to_type_layout_impl(ty, depth + 1))
+            .map(|ty| self.type_to_type_layout_impl(ty, count, depth + 1))
             .collect::<PartialVMResult<Vec<_>>>()?;
+        let field_node_count = *count - count_before;
+
         let struct_layout = MoveStructLayout::new(field_layouts);
 
-        self.type_cache
-            .write()
+        let mut cache = self.type_cache.write();
+        let info = cache
             .structs
             .entry(gidx)
             .or_insert_with(HashMap::new)
             .entry(ty_args.to_vec())
-            .or_insert_with(StructInfo::new)
-            .struct_layout = Some(struct_layout.clone());
+            .or_insert_with(StructInfo::new);
+        info.struct_layout = Some(struct_layout.clone());
+        info.node_count = Some(field_node_count);
 
         Ok(struct_layout)
     }
 
-    fn type_to_type_layout_impl(&self, ty: &Type, depth: usize) -> PartialVMResult<MoveTypeLayout> {
+    fn type_to_type_layout_impl(
+        &self,
+        ty: &Type,
+        count: &mut u64,
+        depth: u64,
+    ) -> PartialVMResult<MoveTypeLayout> {
+        if *count > MAX_TYPE_TO_LAYOUT_NODES {
+            return Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES));
+        }
         if depth > VALUE_DEPTH_MAX {
             return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
         }
         Ok(match ty {
-            Type::Bool => MoveTypeLayout::Bool,
-            Type::U8 => MoveTypeLayout::U8,
-            Type::U16 => MoveTypeLayout::U16,
-            Type::U32 => MoveTypeLayout::U32,
-            Type::U64 => MoveTypeLayout::U64,
-            Type::U128 => MoveTypeLayout::U128,
-            Type::U256 => MoveTypeLayout::U256,
-            Type::Address => MoveTypeLayout::Address,
-            Type::Signer => MoveTypeLayout::Signer,
+            Type::Bool => {
+                *count += 1;
+                MoveTypeLayout::Bool
+            }
+            Type::U8 => {
+                *count += 1;
+                MoveTypeLayout::U8
+            }
+            Type::U16 => {
+                *count += 1;
+                MoveTypeLayout::U16
+            }
+            Type::U32 => {
+                *count += 1;
+                MoveTypeLayout::U32
+            }
+            Type::U64 => {
+                *count += 1;
+                MoveTypeLayout::U64
+            }
+            Type::U128 => {
+                *count += 1;
+                MoveTypeLayout::U128
+            }
+            Type::U256 => {
+                *count += 1;
+                MoveTypeLayout::U256
+            }
+            Type::Address => {
+                *count += 1;
+                MoveTypeLayout::Address
+            }
+            Type::Signer => {
+                *count += 1;
+                MoveTypeLayout::Signer
+            }
             Type::Vector(ty) => {
-                MoveTypeLayout::Vector(Box::new(self.type_to_type_layout_impl(ty, depth + 1)?))
+                *count += 1;
+                MoveTypeLayout::Vector(Box::new(self.type_to_type_layout_impl(
+                    ty,
+                    count,
+                    depth + 1,
+                )?))
             }
             Type::Struct(gidx) => {
-                MoveTypeLayout::Struct(self.struct_gidx_to_type_layout(*gidx, &[], depth)?)
+                *count += 1;
+                MoveTypeLayout::Struct(self.struct_gidx_to_type_layout(*gidx, &[], count, depth)?)
             }
             Type::StructInstantiation(gidx, ty_args) => {
-                MoveTypeLayout::Struct(self.struct_gidx_to_type_layout(*gidx, ty_args, depth)?)
+                *count += 1;
+                MoveTypeLayout::Struct(
+                    self.struct_gidx_to_type_layout(*gidx, ty_args, count, depth)?,
+                )
             }
             Type::Reference(_) | Type::MutableReference(_) | Type::TyParam(_) => {
                 return Err(
                     PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                         .with_message(format!("no type layout for {:?}", ty)),
-                )
+                );
             }
         })
     }
@@ -2555,10 +2815,14 @@ impl Loader {
         &self,
         gidx: CachedStructIndex,
         ty_args: &[Type],
-        depth: usize,
+        count: &mut u64,
+        depth: u64,
     ) -> PartialVMResult<MoveStructLayout> {
         if let Some(struct_map) = self.type_cache.read().structs.get(&gidx) {
             if let Some(struct_info) = struct_map.get(ty_args) {
+                if let Some(annotated_node_count) = &struct_info.annotated_node_count {
+                    *count += *annotated_node_count
+                }
                 if let Some(layout) = &struct_info.annotated_struct_layout {
                     return Ok(layout.clone());
                 }
@@ -2574,27 +2838,30 @@ impl Loader {
                 ),
             );
         }
+        let count_before = *count;
         let struct_tag = self.struct_gidx_to_type_tag(gidx, ty_args)?;
         let field_layouts = struct_type
             .field_names
             .iter()
             .zip(&struct_type.fields)
             .map(|(n, ty)| {
-                let ty = ty.subst(ty_args)?;
-                let l = self.type_to_fully_annotated_layout_impl(&ty, depth + 1)?;
+                let ty = self.subst(ty, ty_args)?;
+                let l = self.type_to_fully_annotated_layout_impl(&ty, count, depth + 1)?;
                 Ok(MoveFieldLayout::new(n.clone(), l))
             })
             .collect::<PartialVMResult<Vec<_>>>()?;
         let struct_layout = MoveStructLayout::with_types(struct_tag, field_layouts);
+        let field_node_count = *count - count_before;
 
-        self.type_cache
-            .write()
+        let mut cache = self.type_cache.write();
+        let info = cache
             .structs
             .entry(gidx)
             .or_insert_with(HashMap::new)
             .entry(ty_args.to_vec())
-            .or_insert_with(StructInfo::new)
-            .annotated_struct_layout = Some(struct_layout.clone());
+            .or_insert_with(StructInfo::new);
+        info.annotated_struct_layout = Some(struct_layout.clone());
+        info.annotated_node_count = Some(field_node_count);
 
         Ok(struct_layout)
     }
@@ -2602,8 +2869,12 @@ impl Loader {
     fn type_to_fully_annotated_layout_impl(
         &self,
         ty: &Type,
-        depth: usize,
+        count: &mut u64,
+        depth: u64,
     ) -> PartialVMResult<MoveTypeLayout> {
+        if *count > MAX_TYPE_TO_LAYOUT_NODES {
+            return Err(PartialVMError::new(StatusCode::TOO_MANY_TYPE_NODES));
+        }
         if depth > VALUE_DEPTH_MAX {
             return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
         }
@@ -2618,19 +2889,19 @@ impl Loader {
             Type::Address => MoveTypeLayout::Address,
             Type::Signer => MoveTypeLayout::Signer,
             Type::Vector(ty) => MoveTypeLayout::Vector(Box::new(
-                self.type_to_fully_annotated_layout_impl(ty, depth + 1)?,
+                self.type_to_fully_annotated_layout_impl(ty, count, depth + 1)?,
             )),
             Type::Struct(gidx) => MoveTypeLayout::Struct(
-                self.struct_gidx_to_fully_annotated_layout(*gidx, &[], depth)?,
+                self.struct_gidx_to_fully_annotated_layout(*gidx, &[], count, depth)?,
             ),
             Type::StructInstantiation(gidx, ty_args) => MoveTypeLayout::Struct(
-                self.struct_gidx_to_fully_annotated_layout(*gidx, ty_args, depth)?,
+                self.struct_gidx_to_fully_annotated_layout(*gidx, ty_args, count, depth)?,
             ),
             Type::Reference(_) | Type::MutableReference(_) | Type::TyParam(_) => {
                 return Err(
                     PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                         .with_message(format!("no type layout for {:?}", ty)),
-                )
+                );
             }
         })
     }
@@ -2640,14 +2911,16 @@ impl Loader {
     }
 
     pub(crate) fn type_to_type_layout(&self, ty: &Type) -> PartialVMResult<MoveTypeLayout> {
-        self.type_to_type_layout_impl(ty, 1)
+        let mut count = 0;
+        self.type_to_type_layout_impl(ty, &mut count, 1)
     }
 
     pub(crate) fn type_to_fully_annotated_layout(
         &self,
         ty: &Type,
     ) -> PartialVMResult<MoveTypeLayout> {
-        self.type_to_fully_annotated_layout_impl(ty, 1)
+        let mut count = 0;
+        self.type_to_fully_annotated_layout_impl(ty, &mut count, 1)
     }
 }
 

@@ -35,8 +35,9 @@ impl FunctionTargetProcessor for CleanAndOptimizeProcessor {
     fn process(
         &self,
         _targets: &mut FunctionTargetsHolder,
-        func_env: &FunctionEnv<'_>,
+        func_env: &FunctionEnv,
         mut data: FunctionData,
+        _scc_opt: Option<&[FunctionEnv]>,
     ) -> FunctionData {
         if func_env.is_native() {
             // Nothing to do
@@ -116,7 +117,8 @@ impl<'a> TransferFunctions for Optimizer<'a> {
                         // Exploit knowledge about builtin functions
                         !(callee_env.is_well_known(VECTOR_BORROW_MUT)
                             || callee_env.is_well_known(EVENT_EMIT_EVENT)
-                            || callee_env.is_intrinsic_of(INTRINSIC_FUN_MAP_BORROW_MUT))
+                            || callee_env.is_intrinsic_of(INTRINSIC_FUN_MAP_BORROW_MUT)
+                            || is_custom_borrow(callee_env, &self.options.borrow_natives))
                     } else {
                         true
                     };
@@ -134,6 +136,16 @@ impl<'a> TransferFunctions for Optimizer<'a> {
             }
         }
     }
+}
+
+/// Check if fun_env matches one of the functions implementing custom mutable borrow semantics.
+fn is_custom_borrow(fun_env: &FunctionEnv, borrow_natives: &Vec<String>) -> bool {
+    for name in borrow_natives {
+        if &fun_env.get_full_name_str() == name {
+            return true;
+        }
+    }
+    false
 }
 
 impl<'a> DataflowAnalysis for Optimizer<'a> {}

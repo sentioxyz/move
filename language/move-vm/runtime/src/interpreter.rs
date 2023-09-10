@@ -22,6 +22,7 @@ use move_vm_types::{
     data_store::DataStore,
     gas::{GasMeter, SimpleInstruction},
     loaded_data::runtime_types::Type,
+    natives::function::NativeResult,
     values::{
         self, GlobalValue, IntegerValue, Locals, Reference, Struct, StructRef, VMValueCast, Value,
         Vector, VectorRef,
@@ -128,7 +129,7 @@ impl Interpreter {
         }
 
         let mut current_frame = self
-            .make_new_frame(function, ty_args, locals)
+            .make_new_frame(loader, function, ty_args, locals)
             .map_err(|err| self.set_location(err))?;
         loop {
             let resolver = current_frame.resolver(loader);
@@ -196,7 +197,7 @@ impl Interpreter {
                         continue;
                     }
                     let frame = self
-                        .make_call_frame(func, vec![])
+                        .make_call_frame(loader, func, vec![])
                         .map_err(|e| self.set_location(e))
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
                     self.call_stack.push(current_frame).map_err(|frame| {
@@ -246,7 +247,7 @@ impl Interpreter {
                         continue;
                     }
                     let frame = self
-                        .make_call_frame(func, ty_args)
+                        .make_call_frame(loader, func, ty_args)
                         .map_err(|e| self.set_location(e))
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
                     self.call_stack.push(current_frame).map_err(|frame| {
@@ -267,6 +268,7 @@ impl Interpreter {
     /// function are incorrectly attributed to the caller.
     fn make_call_frame(
         &mut self,
+        loader: &Loader,
         func: Arc<Function>,
         ty_args: Vec<Type>,
     ) -> PartialVMResult<Frame> {
@@ -278,15 +280,18 @@ impl Interpreter {
 
             if self.paranoid_type_checks {
                 let ty = self.operand_stack.pop_ty()?;
+                let resolver = func.get_resolver(loader);
                 if is_generic {
-                    ty.check_eq(&func.local_types()[arg_count - i - 1].subst(&ty_args)?)?;
+                    ty.check_eq(
+                        &resolver.subst(&func.local_types()[arg_count - i - 1], &ty_args)?,
+                    )?;
                 } else {
                     // Directly check against the expected type to save a clone here.
                     ty.check_eq(&func.local_types()[arg_count - i - 1])?;
                 }
             }
         }
-        self.make_new_frame(func, ty_args, locals)
+        self.make_new_frame(loader, func, ty_args, locals)
     }
 
     /// Create a new `Frame` given a `Function` and the function `Locals`.
@@ -294,6 +299,7 @@ impl Interpreter {
     /// The locals must be loaded before calling this.
     fn make_new_frame(
         &self,
+        loader: &Loader,
         function: Arc<Function>,
         ty_args: Vec<Type>,
         locals: Locals,
@@ -302,10 +308,11 @@ impl Interpreter {
             if ty_args.is_empty() {
                 function.local_types().to_vec()
             } else {
+                let resolver = function.get_resolver(loader);
                 function
                     .local_types()
                     .iter()
-                    .map(|ty| ty.subst(&ty_args))
+                    .map(|ty| resolver.subst(ty, &ty_args))
                     .collect::<PartialVMResult<Vec<_>>>()?
             }
         } else {
@@ -370,13 +377,19 @@ impl Interpreter {
         if self.paranoid_type_checks {
             for i in 0..expected_args {
                 let expected_ty =
-                    function.parameter_types()[expected_args - i - 1].subst(&ty_args)?;
+                    resolver.subst(&function.parameter_types()[expected_args - i - 1], &ty_args)?;
                 let ty = self.operand_stack.pop_ty()?;
                 ty.check_eq(&expected_ty)?;
             }
         }
 
-        let mut native_context = NativeContext::new(self, data_store, resolver, extensions);
+        let mut native_context = NativeContext::new(
+            self,
+            data_store,
+            resolver,
+            extensions,
+            gas_meter.balance_internal(),
+        );
         let native_function = function.get_native()?;
 
         gas_meter.charge_native_function_before_execution(
@@ -391,17 +404,27 @@ impl Interpreter {
 
         // Note(Gas): The order by which gas is charged / error gets returned MUST NOT be modified
         //            here or otherwise it becomes an incompatible change!!!
-        let return_values = match result.result {
-            Ok(vals) => {
-                gas_meter.charge_native_function(result.cost, Some(vals.iter()))?;
-                vals
+        let return_values = match result {
+            NativeResult::Success { cost, ret_vals } => {
+                gas_meter.charge_native_function(cost, Some(ret_vals.iter()))?;
+                ret_vals
             }
-            Err(code) => {
-                gas_meter.charge_native_function(
-                    result.cost,
+            NativeResult::Abort { cost, abort_code } => {
+                gas_meter.charge_native_function(cost, Option::<std::iter::Empty<&Value>>::None)?;
+                return Err(PartialVMError::new(StatusCode::ABORTED).with_sub_status(abort_code));
+            }
+            NativeResult::OutOfGas { partial_cost } => {
+                let err = match gas_meter.charge_native_function(
+                    partial_cost,
                     Option::<std::iter::Empty<&Value>>::None,
-                )?;
-                return Err(PartialVMError::new(StatusCode::ABORTED).with_sub_status(code));
+                ) {
+                    Err(err) if err.major_status() == StatusCode::OUT_OF_GAS => err,
+                    Ok(_) | Err(_) => PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
+                        "The partial cost returned by the native function did not cause the gas meter to trigger an OutOfGas error, at least one of them is violating the contract".to_string()
+                    ),
+                };
+
+                return Err(err);
             }
         };
 
@@ -791,7 +814,14 @@ impl Interpreter {
             }
             internal_state.push_str(format!("{}* {:?}\n", i, code[pc]).as_str());
         }
-        internal_state.push_str(format!("Locals:\n{}\n", current_frame.locals).as_str());
+        internal_state.push_str(
+            format!(
+                "Locals ({:x}):\n{}\n",
+                current_frame.locals.raw_address(),
+                current_frame.locals
+            )
+            .as_str(),
+        );
         internal_state.push_str("Operand Stack:\n");
         for value in &self.operand_stack.value {
             internal_state.push_str(format!("{}\n", value).as_str());
@@ -965,6 +995,91 @@ impl CallStack {
         let location_opt = self.0.last().map(|frame| frame.location());
         location_opt.unwrap_or(Location::Undefined)
     }
+}
+
+fn check_depth_of_type(resolver: &Resolver, ty: &Type) -> PartialVMResult<()> {
+    // Start at 1 since we always call this right before we add a new node to the value's depth.
+    let max_depth = match resolver.loader().vm_config().max_value_nest_depth {
+        Some(max_depth) => max_depth,
+        None => return Ok(()),
+    };
+    check_depth_of_type_impl(resolver, ty, max_depth, 1)?;
+    Ok(())
+}
+
+fn check_depth_of_type_impl(
+    resolver: &Resolver,
+    ty: &Type,
+    max_depth: u64,
+    depth: u64,
+) -> PartialVMResult<u64> {
+    macro_rules! check_depth {
+        ($additional_depth:expr) => {{
+            let new_depth = depth.saturating_add($additional_depth);
+            if new_depth > max_depth {
+                return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
+            } else {
+                new_depth
+            }
+        }};
+    }
+
+    // Calculate depth of the type itself
+    let ty_depth = match ty {
+        Type::Bool
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::U128
+        | Type::U256
+        | Type::Address
+        | Type::Signer => check_depth!(0),
+        // Even though this is recursive this is OK since the depth of this recursion is
+        // bounded by the depth of the type arguments, which we have already checked.
+        Type::Reference(ty) | Type::MutableReference(ty) | Type::Vector(ty) => {
+            check_depth_of_type_impl(resolver, ty, max_depth, check_depth!(1))?
+        }
+        Type::Struct(si) => {
+            let struct_type = resolver.loader().get_struct_type(*si).ok_or_else(|| {
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Struct Definition not resolved".to_string())
+            })?;
+            check_depth!(struct_type
+                .depth
+                .as_ref()
+                .ok_or_else(|| { PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED) })?
+                .solve(&[]))
+        }
+        // NB: substitution must be performed before calling this function
+        Type::StructInstantiation(si, ty_args) => {
+            // Calculate depth of all type arguments, and make sure they themselves are not too deep.
+            let ty_arg_depths = ty_args
+                .iter()
+                .map(|ty| {
+                    // Ty args should be fully resolved and not need any type arguments
+                    check_depth_of_type_impl(resolver, ty, max_depth, check_depth!(0))
+                })
+                .collect::<PartialVMResult<Vec<_>>>()?;
+            let struct_type = resolver.loader().get_struct_type(*si).ok_or_else(|| {
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Struct Definition not resolved".to_string())
+            })?;
+            check_depth!(struct_type
+                .depth
+                .as_ref()
+                .ok_or_else(|| { PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED) })?
+                .solve(&ty_arg_depths))
+        }
+        Type::TyParam(_) => {
+            return Err(
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Type parameter should be fully resolved".to_string()),
+            )
+        }
+    };
+
+    Ok(ty_depth)
 }
 
 /// A `Frame` is the execution context for a function. It holds the locals of the function and
@@ -1814,6 +1929,8 @@ impl Frame {
                     }
                     Bytecode::Pack(sd_idx) => {
                         let field_count = resolver.field_count(*sd_idx);
+                        let struct_type = resolver.get_struct_type(*sd_idx);
+                        check_depth_of_type(resolver, &struct_type)?;
                         gas_meter.charge_pack(
                             false,
                             interpreter.operand_stack.last_n(field_count as usize)?,
@@ -1825,6 +1942,8 @@ impl Frame {
                     }
                     Bytecode::PackGeneric(si_idx) => {
                         let field_count = resolver.field_instantiation_count(*si_idx);
+                        let ty = resolver.instantiate_generic_type(*si_idx, self.ty_args())?;
+                        check_depth_of_type(resolver, &ty)?;
                         gas_meter.charge_pack(
                             true,
                             interpreter.operand_stack.last_n(field_count as usize)?,
@@ -2141,6 +2260,7 @@ impl Frame {
                     }
                     Bytecode::VecPack(si, num) => {
                         let ty = resolver.instantiate_single_type(*si, self.ty_args())?;
+                        check_depth_of_type(resolver, &ty)?;
                         gas_meter.charge_vec_pack(
                             make_ty!(&ty),
                             interpreter.operand_stack.last_n(*num as usize)?,

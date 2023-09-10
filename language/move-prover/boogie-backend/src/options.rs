@@ -46,9 +46,32 @@ impl VectorTheory {
 pub struct CustomNativeOptions {
     /// Bytes of the custom template.
     pub template_bytes: Vec<u8>,
-    /// List of (module name, module instance key) tuples, used to generate instantiated
-    /// versions of generic native functions.
-    pub module_instance_names: Vec<(String, String)>,
+    /// List of (module name, module instance key, single_type_expected) tuples,
+    /// used to generate instantiated versions of generic native functions.
+    pub module_instance_names: Vec<(String, String, bool)>,
+}
+
+/// Contains information about a native method implementing mutable borrow semantics for a given
+/// type in an alternative storage model (returning &mut without taking appropriate &mut as a
+/// parameter, much like vector::borrow_mut)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BorrowAggregate {
+    /// Method's name (qualified with module name, e.g., m::foo)
+    pub name: String,
+    /// Name of the read aggregate
+    pub read_aggregate: String,
+    /// Name of the write aggregate
+    pub write_aggregate: String,
+}
+
+impl BorrowAggregate {
+    pub fn new(name: String, read_aggregate: String, write_aggregate: String) -> Self {
+        BorrowAggregate {
+            name,
+            read_aggregate,
+            write_aggregate,
+        }
+    }
 }
 
 /// Boogie options.
@@ -120,6 +143,8 @@ pub struct BoogieOptions {
     pub custom_natives: Option<CustomNativeOptions>,
     /// Number of iterations to unroll loops.
     pub loop_unroll: Option<u64>,
+    /// Optional aggregate function names for native methods implementing mutable borrow semantics
+    pub borrow_aggregates: Vec<BorrowAggregate>,
 }
 
 impl Default for BoogieOptions {
@@ -156,6 +181,7 @@ impl Default for BoogieOptions {
             z3_trace_file: None,
             custom_natives: None,
             loop_unroll: None,
+            borrow_aggregates: vec![],
         }
     }
 }

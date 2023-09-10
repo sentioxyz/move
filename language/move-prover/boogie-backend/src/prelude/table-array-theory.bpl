@@ -39,7 +39,7 @@ function {:inline} ContainsTable<K,V>(t: Table K V, k: K): bool {
 }
 
 function {:inline} UpdateTable<K,V>(t: Table K V, k: K, v: V): Table K V {
-    Table(v#Table(t)[k := v], e#Table(t)[k := true], l#Table(t))
+    Table(v#Table(t)[k := v], e#Table(t), l#Table(t))
 }
 
 function {:inline} AddTable<K,V>(t: Table K V, k: K, v: V): Table K V {
@@ -53,3 +53,10 @@ function {:inline} RemoveTable<K,V>(t: Table K V, k: K): Table K V {
     // Similar as above, we only need to consider the case where the key is in the table.
     Table(v#Table(t), e#Table(t)[k := false], l#Table(t) - 1)
 }
+
+axiom {:ctor "Table"} (forall<K,V> t: Table K V :: {LenTable(t)}
+    (exists k: K :: {ContainsTable(t, k)} ContainsTable(t, k)) ==> LenTable(t) >= 1
+);
+// TODO: we might want to encoder a stronger property that the length of table
+// must be more than N given a set of N items. Currently we don't see a need here
+// and the above axiom seems to be sufficient.
